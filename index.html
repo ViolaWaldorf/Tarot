@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>感应塔罗 - 手势交互版</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+    <style>
+        body { margin: 0; background: #050505; color: gold; font-family: 'Palatino', serif; overflow: hidden; }
+        #ui-overlay { position: absolute; top: 20px; left: 20px; z-index: 100; pointer-events: none; }
+        #history { position: absolute; right: 20px; top: 20px; width: 200px; background: rgba(0,0,0,0.7); padding: 10px; border: 1px solid #444; height: 80vh; overflow-y: auto; }
+        .btn-panel { position: absolute; bottom: 20px; left: 50%; transform: translateX(-50%); pointer-events: auto; }
+        button { background: #333; color: gold; border: 1px solid gold; padding: 10px 20px; cursor: pointer; margin: 0 10px; }
+        #video-container { position: absolute; bottom: 10px; right: 10px; width: 160px; height: 120px; border: 1px solid #333; transform: rotateY(180deg); opacity: 0.5; }
+        canvas { display: block; }
+        .log-item { border-bottom: 1px solid #333; padding: 5px 0; font-size: 0.9em; }
+    </style>
+</head>
+<body>
+
+<div id="ui-overlay">
+    <h1>感应塔罗</h1>
+    <div id="status">模式：初始化中...</div>
+    <div id="card-desc" style="margin-top: 20px; max-width: 300px; font-size: 1.2em; color: #fff;"></div>
+</div>
+
+<div id="history"><h3>历史记录</h3><div id="history-list"></div></div>
+
+<video id="video-container" autoplay></video>
+
+<div class="btn-panel">
+    <button onclick="toggleMode()">切换 手势/鼠标</button>
+</div>
+
+<script id="ash-vs" type="x-shader/x-vertex">
+    varying vec2 vUv;
+    varying float vLife;
+    uniform float uTime;
+    attribute float aLife;
+    attribute vec3 aOffset;
+    void main() {
+        vUv = uv;
+        vLife = aLife - uTime * 0.2; 
+        vec3 pos = position + aOffset;
+        pos.y += (1.0 - vLife) * 2.0; // 向上飘
+        pos.x += sin(uTime + pos.y) * 0.1; // 湍流
+        vec4 mvPosition = modelViewMatrix * vec4(pos, 1.0);
+        gl_PointSize = (10.0 * vLife) * (300.0 / -mvPosition.z);
+        gl_Position = projectionMatrix * mvPosition;
+    }
+</script>
+
+<script id="ash-fs" type="x-shader/x-fragment">
+    varying float vLife;
+    void main() {
+        if (vLife <= 0.0) discard;
+        gl_FragColor = vec4(0.8, 0.7, 0.5, vLife); // 灰烬颜色
+    }
+</script>
+
+<script>
+/** * 1. 基础配置与牌库
+ */
+const CARD_DB = [
+    { name: "愚者", up: "开始、冒险、纯真", rev: "鲁莽、草率、虚荣", img: "https://upload.wikimedia.org/wikipedia/en/9/90/RWS_Tarot_00_Fool.jpg" },
+    { name: "魔术师", up: "创造力、行动、潜能", rev: "幻象、优柔寡断、操纵", img: "https://upload.wikimedia.org/wikipedia/en/d/de/RWS_Tarot_01_Magician.jpg" },
+    // 此处可扩展至78张...
+];
+
+let deck = [...CARD_DB];
+let scene, camera, renderer, raycaster;
+let currentCard = null, particles = null;
+let isMouseMode = false;
+let interactionState = 'IDLE'; // IDLE, SCANNING, GRABBING, LOCKED
+
+/** * 2. 初始化 Three.js 场景
+ */
+function initScene() {
+    scene = new THREE.Scene();
+    camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+    renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    document.body.appendChild(renderer.domElement);
+    
+    const ambientLight = new THREE.AmbientLight(0xffffff, 0.5);
+    scene.add(ambientLight);
+    const pointLight = new THREE.PointLight(0xffd700, 1);
+    pointLight.position.set(5, 5, 5);
+    scene.add(pointLight);
+
+    camera.position.z = 5;
+    raycaster = new THREE.Raycaster();
+    
+    spawnNewCard();
+    animate();
+}
+
+/** * 3. 核心功能：生成新卡牌
+ */
+function spawnNewCard() {
+    if (deck.length === 0) {
+        document.getElementById('status').innerText = "牌库已空";
+        return;
+    }
+
+    const geometry = new THREE.BoxGeometry(2, 3, 0.05);
+    const backTex = new THREE.TextureLoader().load('https://i.pinimg.com/originals/81/25/3c/81253c5c9603f02e12e1719b67b36f75.jpg'); // 示例牌背
+    
+    // 随机抽牌逻辑
+    const index = Math.floor(Math.random() * deck.length);
+    const cardData = deck.splice(index, 1)[0];
+    const isReversed = Math.random() < 0.5;
+    
+    const frontTex = new THREE.TextureLoader().load(cardData.img, undefined, undefined, (err) => {
+        console.warn("贴图加载失败，使用占位色");
+    });
+
+    const materials = [
+        new THREE.MeshStandardMaterial({ color: 0x333333 }), // side
+        new THREE.MeshStandardMaterial({ color: 0x333333 }), // side
+        new THREE.MeshStandardMaterial({ color: 0x333333 }), // side
+        new THREE.MeshStandardMaterial({ color: 0x333333 }), // side
+        new THREE.MeshStandardMaterial({ map: frontTex }),   // front
+        new THREE.MeshStandardMaterial({ map: backTex })    // back
+    ];
+
+    currentCard = new THREE.Mesh(geometry, materials);
+    currentCard.userData = { ...cardData, isReversed };
+    
+    // 如果逆位，绕Z轴转180
+    if (isReversed) currentCard.rotation.z = Math.PI;
+    
+    // 初始位置
+    currentCard.position.set(0, -5, 0); 
+    scene.add(currentCard);
+    
+    // 入场动画
+    new TWEEN_SIM(currentCard.position).to({ y: 0 }, 1000);
+}
+
+/** * 4. 灰烬逻辑实现
+ */
+function createAshes(targetMesh) {
+    const count = 2000;
+    const geometry = new THREE.BufferGeometry();
+    const positions = new Float32Array(count * 3);
+    const offsets = new Float32Array(count * 3);
+    const lives = new Float32Array(count);
+    
+    for (let i = 0; i < count; i++) {
+        lives[i] = Math.random();
+        offsets[i*3] = (Math.random()-0.5) * 2;
+        offsets[i*3+1] = (Math.random()-0.5) * 3;
+        offsets[i*3+2] = (Math.random()-0.5) * 0.1;
+    }
+    
+    geometry.setAttribute('position', targetMesh.geometry.attributes.position);
+    geometry.setAttribute('aOffset', new THREE.BufferAttribute(offsets, 3));
+    geometry.setAttribute('aLife', new THREE.BufferAttribute(lives, 1));
+    
+    const material = new THREE.ShaderMaterial({
+        vertexShader: document.getElementById('ash-vs').textContent,
+        fragmentShader: document.getElementById('ash-fs').textContent,
+        uniforms: { uTime: { value: 0 } },
+        transparent: true,
+        blending: THREE.AdditiveBlending
+    });
+    
+    const ashPoints = new THREE.Points(geometry, material);
+    ashPoints.position.copy(targetMesh.position);
+    ashPoints.rotation.copy(targetMesh.rotation);
+    scene.add(ashPoints);
+    
+    // 移除原卡牌并记录
+    const data = targetMesh.userData;
+    const record = `${data.name} (${data.isReversed ? '逆位' : '正位'})`;
+    const log = document.createElement('div');
+    log.className = 'log-item';
+    log.innerText = record;
+    document.getElementById('history-list').prepend(log);
+    
+    scene.remove(targetMesh);
+    
+    // 3秒后彻底清除粒子并生成下一张
+    setTimeout(() => {
+        scene.remove(ashPoints);
+        spawnNewCard();
+    }, 3000);
+    
+    return ashPoints;
+}
+
+/** * 5. 手势识别与降级逻辑
+ */
+const hands = new Hands({
+    locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+});
+
+hands.setOptions({ maxNumHands: 1, modelComplexity: 1, minDetectionConfidence: 0.7, minTrackingConfidence: 0.5 });
+hands.onResults(onHandResults);
+
+const videoElement = document.getElementById('video-container');
+const cameraUtils = new Camera(videoElement, {
+    onFrame: async () => { await hands.send({image: videoElement}); },
+    width: 640, height: 480
+});
+
+cameraUtils.start().catch(() => {
+    isMouseMode = true;
+    document.getElementById('status').innerText = "模式：鼠标感应 (摄像头失败)";
+});
+
+function onHandResults(results) {
+    if (isMouseMode || !results.multiHandLandmarks.length) return;
+    
+    const landmarks = results.multiHandLandmarks[0];
+    const indexTip = landmarks[8];
+    const thumbTip = landmarks[4];
+    const middleTip = landmarks[12];
+    
+    // 计算手势
+    const distPinch = Math.hypot(indexTip.x - thumbTip.x, indexTip.y - thumbTip.y);
+    const isOpen = landmarks[12].y < landmarks[9].y && landmarks[20].y < landmarks[17].y;
+    const isFist = landmarks[8].y > landmarks[5].y && landmarks[12].y > landmarks[9].y;
+
+    // 坐标映射
+    const x = (0.5 - indexTip.x) * 10; // 镜像处理
+    const y = (0.5 - indexTip.y) * 8;
+    
+    updateInteraction(x, y, { isOpen, isPinch: distPinch < 0.05, isFist });
+}
+
+function updateInteraction(x, y, gestures) {
+    if (!currentCard) return;
+
+    if (gestures.isOpen) {
+        interactionState = 'SCANNING';
+        document.getElementById('status').innerText = "状态：感应中 (手掌张开)";
+        currentCard.position.lerp(new THREE.Vector3(x, y, 0), 0.1);
+    } else if (gestures.isPinch) {
+        interactionState = 'GRABBING';
+        document.getElementById('status').innerText = "状态：抓取中";
+        currentCard.position.lerp(new THREE.Vector3(x, y, 2), 0.2); // 拉近
+        currentCard.rotation.y += 0.05; // 旋转展示
+    } else if (gestures.isFist && interactionState === 'GRABBING') {
+        interactionState = 'LOCKED';
+        document.getElementById('status').innerText = "状态：确认结果";
+        const data = currentCard.userData;
+        document.getElementById('card-desc').innerText = `${data.name} - ${data.isReversed ? '逆位：' + data.rev : '正位：' + data.up}`;
+        
+        // 触发灰烬效果
+        particles = createAshes(currentCard);
+        currentCard = null;
+    }
+}
+
+// 模拟简易动画
+function TWEEN_SIM(obj) {
+    this.to = (target, duration) => {
+        const startY = obj.y;
+        let start = null;
+        const step = (timestamp) => {
+            if (!start) start = timestamp;
+            const progress = (timestamp - start) / duration;
+            obj.y = startY + (target.y - startY) * Math.min(progress, 1);
+            if (progress < 1) requestAnimationFrame(step);
+        };
+        requestAnimationFrame(step);
+    };
+}
+
+function animate() {
+    requestAnimationFrame(animate);
+    if (particles) {
+        particles.material.uniforms.uTime.value += 0.016;
+    }
+    renderer.render(scene, camera);
+}
+
+function toggleMode() {
+    isMouseMode = !isMouseMode;
+    document.getElementById('status').innerText = isMouseMode ? "模式：鼠标感应" : "模式：手势感应";
+}
+
+// 启动
+window.onload = initScene;
+
+// 鼠标兜底
+window.addEventListener('mousemove', (e) => {
+    if (!isMouseMode) return;
+    const x = (e.clientX / window.innerWidth - 0.5) * 10;
+    const y = -(e.clientY / window.innerHeight - 0.5) * 8;
+    updateInteraction(x, y, { isOpen: !e.buttons, isPinch: e.buttons === 1, isFist: e.buttons === 2 });
+});
+</script>
+</body>
+</html>
